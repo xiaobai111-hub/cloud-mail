@@ -35,7 +35,8 @@ export async function email(message, env, ctx) {
 			blackContent,
 			blackFrom,
 			aiCode,
-			aiCodeFilter
+			aiCodeFilter,
+			resendTokens
 		} = await settingService.query({ env });
 
 		if (receive === settingConst.receive.CLOSE) {
@@ -176,20 +177,29 @@ export async function email(message, env, ctx) {
 			await telegramService.sendEmailToBot({ env }, emailRow)
 		}
 
-		//转发到其他邮箱
+		//转发到其他邮箱（走 Resend：本账号的 message.forward() 每次失败且无原因，
+		//与目标地址是否验证无关；站外发信走 Resend 是通的）
 		if (forwardStatus === settingConst.forwardStatus.OPEN && forwardEmail) {
 
-			const emails = forwardEmail.split(',');
+			const fromEmail = account?.email || message.to;
 
-			await Promise.all(emails.map(async email => {
-
-				try {
-					await message.forward(email);
-				} catch (e) {
-					console.error(`转发邮箱 ${email} 失败：`, e);
-				}
-
-			}));
+			await emailService.forwardByResend({ env }, {
+				fromEmail,
+				fromName: emailRow.toName || emailUtils.getName(fromEmail),
+				subject: email.subject || emailRow.subject || '',
+				text: email.text || emailRow.text || '',
+				html: email.html || emailRow.content || '',
+				attachments: email.attachments || [],
+				addresses: forwardEmail.split(',').map(address => address.trim()).filter(Boolean),
+				info: {
+					fromAddress: email.from?.address || emailRow.sendEmail || '',
+					fromName: email.from?.name || emailRow.name || '',
+					toAddress: message.to,
+					dateText: email.date ? String(email.date) : (emailRow.createTime || ''),
+					subject: email.subject || emailRow.subject || ''
+				},
+				resendTokens
+			});
 
 		}
 

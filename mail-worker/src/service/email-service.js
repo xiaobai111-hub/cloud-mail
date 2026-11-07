@@ -24,7 +24,6 @@ import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
 import webhookService from './webhook-service';
-import forwardMime from '../utils/forward-mime';
 
 const emailService = {
 
@@ -964,7 +963,7 @@ const emailService = {
 	//站内邮件不经过 email 事件，在这里按转发规则推送
 	async forwardOnSiteEmail(c, emailRowList, { sendParams }) {
 
-		const { tgBotStatus, tgChatId, forwardStatus, forwardEmail, webhookStatus, webhookUrl, webhookRetry, webhookSecret, ruleEmail, ruleType } = await settingService.query(c);
+		const { tgBotStatus, tgChatId, forwardStatus, forwardEmail, webhookStatus, webhookUrl, webhookRetry, webhookSecret, ruleEmail, ruleType, resendTokens } = await settingService.query(c);
 
 		if (ruleType === settingConst.ruleType.RULE) {
 			const emails = ruleEmail.split(',');
@@ -985,31 +984,113 @@ const emailService = {
 
 		}
 
-		//转发到其他邮箱。发件人用站内实际发件人，信头收件人保留原收件人，信封送到已验证地址。
+		//转发到其他邮箱（走 Resend，见 forwardByResend）。发件人用站内实际发件人；
+		//原先走 forwardMime + send_email 绑定（c.env.forward），在本账号上每次失败且无原因。
 		if (forwardStatus === settingConst.forwardStatus.OPEN && forwardEmail && emailRowList.length > 0) {
 
 			const addresses = forwardEmail.split(',').map(address => address.trim()).filter(Boolean);
-			const params = {
-				...sendParams,
-				attachments: await this.toCloudflareAttachments(sendParams.attachments || []),
-				receiveEmail: emailRowList.map(row => ({ address: row.toEmail, name: row.toName || '' })).filter(item => item.address)
-			};
 
-			await Promise.all(addresses.map(async address => {
-
-				try {
-					const result = await forwardMime.send(c.env.forward, params, address);
-					if (result?.error) {
-						console.error(`转发邮箱 ${address} 失败：`, result.error);
-					}
-				} catch (e) {
-					console.error(`转发邮箱 ${address} 失败：`, e);
-				}
-
-			}));
+			await this.forwardByResend(c, {
+				fromEmail: sendParams.accountEmail,
+				fromName: sendParams.name,
+				subject: sendParams.subject,
+				text: sendParams.text,
+				html: sendParams.html,
+				attachments: sendParams.attachments || [],
+				addresses,
+				info: null,
+				resendTokens
+			});
 
 		}
 
+	},
+
+	// 取指定域名的 Resend Token；取不到返回 null（调用方记日志，不抛错）。
+	getResendToken(resendTokens, domain) {
+		if (!resendTokens || !domain) {
+			return null;
+		}
+		return resendTokens[domain] || resendTokens[String(domain).toLowerCase()] || null;
+	},
+
+	// 把一行文本里的换行压成空格（用于转发信息块与发件人名，避免请求头串行）。
+	oneLine(value) {
+		return String(value ?? '').replace(/[\r\n]+/g, ' ').trim();
+	},
+
+	// HTML 转义（只用于转发信息块里的原始字段）。
+	escapeHtml(value) {
+		return String(value ?? '')
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;');
+	},
+
+	// 通过 Resend 向每个转发地址各发一份转发副本；单个地址失败只记日志，不抛错，
+	// 不影响收信/发信主流程。fromEmail 必须是已在 Resend 验证的域名下的地址，
+	// 否则 Resend 会拒收。info 为空时不加信息块、不改主题（发信路径沿用原
+	// forwardMime 的行为，只换通道）；info 非空时加 "Fwd: " 主题前缀与原文信息块。
+	async forwardByResend(c, { fromEmail, fromName, subject, text, html, attachments, addresses, info, resendTokens }) {
+
+		const list = (addresses || []).map(address => String(address).trim()).filter(Boolean);
+		if (list.length === 0) {
+			return;
+		}
+
+		const domain = emailUtils.getDomain(fromEmail);
+		const resendToken = this.getResendToken(resendTokens, domain);
+
+		if (!resendToken) {
+			for (const address of list) {
+				console.error(`转发邮箱 ${address} 失败：域名 ${domain} 未配置 Resend Token，请在系统设置中为该域名配置 Resend Token。`);
+			}
+			return;
+		}
+
+		const cleanName = this.oneLine(fromName) || emailUtils.getName(fromEmail);
+		const origText = text || '';
+		const origHtml = html || '';
+		let fwdSubject = subject || '';
+		let fwdText = origText;
+		let fwdHtml = origHtml;
+
+		if (info) {
+			if (!/^fwd:/i.test(fwdSubject.trim())) {
+				fwdSubject = `Fwd: ${fwdSubject}`;
+			}
+			const infoLines = [
+				`发件人：${this.oneLine(info.fromName) ? `${this.oneLine(info.fromName)} <${info.fromAddress}>` : info.fromAddress}`,
+				`收件人：${this.oneLine(info.toAddress)}`,
+				`日期：${this.oneLine(info.dateText)}`,
+				`主题：${this.oneLine(info.subject)}`
+			];
+			fwdText = `---------- 转发自 Cloud Mail ----------\n${infoLines.join('\n')}\n\n${origText}`;
+			const infoHtml = infoLines.map(line => `<div>${this.escapeHtml(line)}</div>`).join('');
+			fwdHtml = `<div style="border-left:3px solid #888;padding:8px 12px;margin-bottom:12px;color:#555;font-size:13px;line-height:1.6">${infoHtml}</div><hr>${origHtml || `<pre>${this.escapeHtml(origText)}</pre>`}`;
+		}
+
+		await Promise.all(list.map(async address => {
+
+			try {
+				const result = await this.sendByResend(resendToken, {
+					name: cleanName,
+					accountEmail: fromEmail,
+					receiveEmail: [address],
+					subject: fwdSubject,
+					text: fwdText,
+					html: fwdHtml,
+					attachments: attachments || []
+				});
+				if (result?.error) {
+					console.error(`转发邮箱 ${address} 失败：`, result.error);
+				}
+			} catch (e) {
+				console.error(`转发邮箱 ${address} 失败：`, e);
+			}
+
+		}));
 	},
 
 	imgReplace(content, cidAttList, r2domain) {
